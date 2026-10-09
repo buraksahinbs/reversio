@@ -124,7 +124,6 @@ hizmet koşullarına uygun şekilde kullanın.
 - [x] Kaydedilen trafiği tekrar oynatarak SDK doğrulama ve drift raporu
 - [ ] Python SDK
 - [ ] mitmproxy akışlarını içe aktarma
-- [ ] JS bundle'ında auth ve imzalama mantığını bulma (source map + AST)
 - [ ] Playwright ile otomatik keşif, `reversio <url>` tek komutu
 - [ ] MCP sunucusu (ajanlar için 4–5 araç)
 

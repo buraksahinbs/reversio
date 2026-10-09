@@ -66,17 +66,31 @@ function segments(path: string): string[] {
   return path.split("/").filter(Boolean).map(safeDecode);
 }
 
+/** Path prefix of a server URL (`https://x.com/api/v2` → ["api", "v2"]). Relative URLs are allowed. */
+function serverPrefix(server: string | undefined): string[] {
+  if (!server) return [];
+  try {
+    return segments(new URL(server, "http://localhost").pathname);
+  } catch {
+    return [];
+  }
+}
+
 /** Find the operation for an exchange. Literal segments win over parameters (`/users/me` over `/users/{id}`). */
 export function matchOperation(
   spec: Spec,
   ex: Exchange,
 ): { op: SpecOperation; pathValues: Record<string, string> } | undefined {
-  const actual = segments(ex.url.pathname);
+  const fullPath = segments(ex.url.pathname);
   let best: { op: SpecOperation; pathValues: Record<string, string>; literals: number } | undefined;
 
   for (const op of spec.operations) {
     if (op.method !== ex.method) continue;
-    if (op.server && new URL(op.server).origin !== ex.url.origin) continue;
+    if (op.server && /^https?:/i.test(op.server) && new URL(op.server).origin !== ex.url.origin) continue;
+    // Templates are relative to the server URL, which may carry a base path.
+    const prefix = serverPrefix(op.server ?? spec.servers[0]);
+    if (!prefix.every((seg, i) => fullPath[i] === seg)) continue;
+    const actual = fullPath.slice(prefix.length);
     const template = op.path.split("/").filter(Boolean);
     if (template.length !== actual.length) continue;
 
@@ -218,7 +232,7 @@ export async function verifyReplay(spec: Spec, exchanges: Exchange[], sdkSource?
     const { op, pathValues } = match;
     const report = reports.get(op)!;
     report.samples++;
-    const problems = await replayOne(sdk, op, pathValues, ex, validate);
+    const problems = await replayOne(sdk, spec, op, pathValues, ex, validate);
     if (problems.length === 0) report.passed++;
     for (const p of problems) report.failures.set(p, (report.failures.get(p) ?? 0) + 1);
   }
@@ -244,6 +258,7 @@ export async function verifyReplay(spec: Spec, exchanges: Exchange[], sdkSource?
 
 async function replayOne(
   sdk: SdkModule,
+  spec: Spec,
   op: SpecOperation,
   pathValues: Record<string, string>,
   ex: Exchange,
@@ -271,7 +286,9 @@ async function replayOne(
 
   // Primary-server operations may be recorded on any origin (staging, regional hosts), so the
   // client is pointed at the recorded one; path-level servers are exercised as generated.
-  const client = new sdk.ApiClient({ fetch: fakeFetch, ...(!op.server && { baseUrl: ex.url.origin }) });
+  const prefix = serverPrefix(spec.servers[0]).map(encodeURIComponent).join("/");
+  const baseUrl = prefix ? `${ex.url.origin}/${prefix}` : ex.url.origin;
+  const client = new sdk.ApiClient({ fetch: fakeFetch, ...(!op.server && { baseUrl }) });
   const method = client[sdkMethodName(op.operationId)];
   if (typeof method !== "function") return [`SDK has no method ${sdkMethodName(op.operationId)}`];
 

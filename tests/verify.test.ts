@@ -81,3 +81,17 @@ describe("matchOperation", () => {
     expect(matchOperation(spec, seven!)).toMatchObject({ op: { path: "/api/users/{userId}" }, pathValues: { userId: "7" } });
   });
 });
+
+describe("servers with a base path", () => {
+  it("matches and replays operations relative to the server path", async () => {
+    const doc = buildOpenApi(calls([{ url: "https://x.dev/api/v2/items/1", response: { id: 1 } }])) as any;
+    // Move the shared prefix into the server URL, as hand-written specs usually do.
+    doc.servers = [{ url: "https://x.dev/api/v2" }];
+    doc.paths = { "/items/{itemId}": doc.paths["/api/v2/items/{itemId}"] };
+    const spec = readSpec(doc);
+    const recorded = calls([2, 3].map((id) => ({ url: `https://x.dev/api/v2/items/${id}`, response: { id } })));
+    const report = await verifyReplay(spec, recorded);
+    expect(report.unmatched).toEqual([]);
+    expect(report.passed).toBe(2);
+  });
+});
