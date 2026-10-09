@@ -1,0 +1,31 @@
+{
+  "name": "reversio",
+  "version": "0.1.0",
+  "description": "Turn captured traffic of undocumented web APIs into OpenAPI specs and typed SDKs.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "reversio": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
