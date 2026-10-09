@@ -13,6 +13,7 @@
  * shows up: new endpoints, parameters, fields or status codes.
  */
 
+import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { stripTypeScriptTypes } from "node:module";
 import { tmpdir } from "node:os";
@@ -24,6 +25,7 @@ import addFormats from "ajv-formats";
 import type { Exchange } from "./har.js";
 import type { JsonSchema } from "./schema.js";
 import type { Spec, SpecOperation, SpecParameter } from "./spec.js";
+import { generatePythonSdk, pyMethodName } from "./sdk/python.js";
 import { generateTypeScriptSdk, pathArgName, sdkMethodName } from "./sdk/typescript.js";
 
 export interface OperationReport {
@@ -37,6 +39,7 @@ export interface OperationReport {
 }
 
 export interface VerifyReport {
+  language: SdkLanguage;
   total: number;
   passed: number;
   operations: OperationReport[];
@@ -46,13 +49,6 @@ export interface VerifyReport {
 
 type SdkClient = Record<string, (args?: unknown, init?: RequestInit) => Promise<unknown>>;
 type SdkModule = { ApiClient: new (options: Record<string, unknown>) => SdkClient };
-
-interface CapturedRequest {
-  method: string;
-  url: URL;
-  headers: Headers;
-  body: string | null;
-}
 
 function safeDecode(segment: string): string {
   try {
@@ -155,27 +151,84 @@ function describeQueryDiff(sent: URL, recorded: URL): string {
   return `query differs (${parts.join("; ")})`;
 }
 
-function decodeSentBody(captured: CapturedRequest): unknown {
-  if (captured.body === null) return undefined;
-  const type = captured.headers.get("content-type") ?? "";
-  if (type.startsWith("application/x-www-form-urlencoded")) return Object.fromEntries(new URLSearchParams(captured.body));
+function decodeSentBody(request: ExecutedRequest): unknown {
+  if (request.body === null) return undefined;
+  if ((request.contentType ?? "").startsWith("application/x-www-form-urlencoded")) {
+    return Object.fromEntries(new URLSearchParams(request.body));
+  }
   try {
-    return JSON.parse(captured.body);
+    return JSON.parse(request.body);
   } catch {
-    return captured.body;
+    return request.body;
   }
 }
 
-function recordedResponse(ex: Exchange): Response {
+function formatAjvErrors(errors: { instancePath: string; message?: string }[] | null | undefined): string {
+  const first = errors?.[0];
+  return first ? `${first.instancePath || "(root)"} ${first.message ?? "is invalid"}` : "is invalid";
+}
+
+export type SdkLanguage = "typescript" | "python";
+
+export interface VerifyOptions {
+  /** SDK language to replay through. Default: typescript. */
+  language?: SdkLanguage;
+  /** Use this SDK source instead of generating one from the spec. */
+  sdkSource?: string;
+  /** Python interpreter for language "python". Default: $REVERSIO_PYTHON or python3. */
+  python?: string;
+}
+
+/** A recorded call turned into language-neutral SDK arguments and a canned response. */
+export interface ReplayCase {
+  op: SpecOperation;
+  ex: Exchange;
+  /** Base URL to construct the client with, for operations on the primary server. */
+  baseUrl?: string;
+  /** Path parameter values in declaration order. */
+  pathArgs: { name: string; value: unknown }[];
+  query?: Record<string, unknown>;
+  body?: unknown;
+  response: { status: number; contentType: string | null; body: string | null };
+}
+
+interface ExecutedRequest {
+  method: string;
+  url: string;
+  contentType: string | null;
+  body: string | null;
+}
+
+/** What happened when an SDK ran one replay case. */
+export interface Execution {
+  request?: ExecutedRequest;
+  result?: unknown;
+  error?: { status?: number; body?: unknown; message: string };
+}
+
+function buildCase(spec: Spec, op: SpecOperation, pathValues: Record<string, string>, ex: Exchange): ReplayCase {
   const nullBody = ex.status === 204 || ex.status === 205 || ex.status === 304;
   const body = nullBody || ex.responseBody === undefined ? null : JSON.stringify(ex.responseBody);
-  const headers = new Headers();
-  if (body !== null) headers.set("content-type", ex.responseContentType ?? "application/json");
-  return new Response(body, { status: ex.status, headers });
+  const replay: ReplayCase = {
+    op,
+    ex,
+    pathArgs: op.pathParams.map((p) => ({ name: p.name, value: coerceToSchema(pathValues[p.name] ?? "", p.schema) })),
+    response: { status: ex.status, contentType: body === null ? null : (ex.responseContentType ?? "application/json"), body },
+  };
+  // Primary-server operations may be recorded on any origin (staging, regional hosts), so the
+  // client is pointed at the recorded one; path-level servers are exercised as generated.
+  if (!op.server) {
+    const prefix = serverPrefix(spec.servers[0]).map(encodeURIComponent).join("/");
+    replay.baseUrl = prefix ? `${ex.url.origin}/${prefix}` : ex.url.origin;
+  }
+  const query = queryArgs(op.queryParams, ex.url);
+  if (query) replay.query = query;
+  if (ex.requestBody !== undefined) replay.body = ex.requestBody;
+  return replay;
 }
 
 /** Load generated TypeScript as an ES module via Node's type stripping. */
-async function loadSdk(source: string): Promise<SdkModule> {
+async function loadTypeScriptSdk(source: string): Promise<SdkModule> {
   const emit = process.emitWarning;
   // stripTypeScriptTypes is stable in practice but flagged experimental; keep CLI output clean.
   process.emitWarning = (() => {}) as typeof process.emitWarning;
@@ -195,136 +248,164 @@ async function loadSdk(source: string): Promise<SdkModule> {
   }
 }
 
-function formatAjvErrors(errors: { instancePath: string; message?: string }[] | null | undefined): string {
-  const first = errors?.[0];
-  return first ? `${first.instancePath || "(root)"} ${first.message ?? "is invalid"}` : "is invalid";
-}
+async function runTypeScript(source: string, cases: ReplayCase[]): Promise<Execution[]> {
+  const sdk = await loadTypeScriptSdk(source);
+  const executions: Execution[] = [];
+  for (const c of cases) {
+    const execution: Execution = {};
+    const fakeFetch = async (input: URL | RequestInfo, init?: RequestInit): Promise<Response> => {
+      const headers = new Headers(init?.headers);
+      execution.request = {
+        method: init?.method ?? "GET",
+        url: input instanceof Request ? input.url : String(input),
+        contentType: headers.get("content-type"),
+        body: typeof init?.body === "string" ? init.body : null,
+      };
+      const responseHeaders = new Headers();
+      if (c.response.contentType) responseHeaders.set("content-type", c.response.contentType);
+      return new Response(c.response.body, { status: c.response.status, headers: responseHeaders });
+    };
 
-/**
- * Verify recorded exchanges (already filtered to API calls) against a spec and
- * its generated TypeScript SDK.
- */
-export async function verifyReplay(spec: Spec, exchanges: Exchange[], sdkSource?: string): Promise<VerifyReport> {
-  const sdk = await loadSdk(sdkSource ?? generateTypeScriptSdk(spec));
-  const ajv = new Ajv2020({ allErrors: false, strict: false });
-  addFormats.default(ajv);
-  const validators = new Map<JsonSchema, ReturnType<typeof ajv.compile>>();
-  const validate = (schema: JsonSchema, value: unknown): string | undefined => {
-    let fn = validators.get(schema);
-    if (!fn) {
-      fn = ajv.compile(schema);
-      validators.set(schema, fn);
-    }
-    return fn(value) ? undefined : formatAjvErrors(fn.errors);
-  };
-
-  const reports = new Map<SpecOperation, { samples: number; passed: number; failures: Map<string, number> }>();
-  for (const op of spec.operations) reports.set(op, { samples: 0, passed: 0, failures: new Map() });
-  const unmatched: VerifyReport["unmatched"] = [];
-
-  for (const ex of exchanges) {
-    if (ex.status < 200 || ex.status > 599) continue;
-    const match = matchOperation(spec, ex);
-    if (!match) {
-      unmatched.push({ method: ex.method, url: `${ex.url.origin}${ex.url.pathname}` });
+    const client = new sdk.ApiClient({ fetch: fakeFetch, ...(c.baseUrl !== undefined && { baseUrl: c.baseUrl }) });
+    const name = sdkMethodName(c.op.operationId);
+    const method = client[name];
+    if (typeof method !== "function") {
+      executions.push({ error: { message: `SDK has no method ${name}` } });
       continue;
     }
-    const { op, pathValues } = match;
-    const report = reports.get(op)!;
-    report.samples++;
-    const problems = await replayOne(sdk, spec, op, pathValues, ex, validate);
-    if (problems.length === 0) report.passed++;
-    for (const p of problems) report.failures.set(p, (report.failures.get(p) ?? 0) + 1);
+    const args: Record<string, unknown> = {};
+    for (const p of c.pathArgs) args[pathArgName(p.name)] = p.value;
+    if (c.query) args.query = c.query;
+    if ("body" in c) args.body = c.body;
+    try {
+      execution.result = await method.call(client, args);
+    } catch (err) {
+      const e = err as { status?: unknown; body?: unknown; message?: unknown };
+      execution.error = {
+        ...(typeof e.status === "number" && { status: e.status, body: e.body }),
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+    executions.push(execution);
   }
-
-  const operations: OperationReport[] = spec.operations.map((op) => {
-    const r = reports.get(op)!;
-    return {
-      operationId: op.operationId,
-      method: op.method,
-      path: op.path,
-      samples: r.samples,
-      passed: r.passed,
-      failures: [...r.failures].sort((a, b) => b[1] - a[1]).map(([reason, count]) => ({ reason, count })),
-    };
-  });
-  return {
-    total: operations.reduce((n, o) => n + o.samples, 0),
-    passed: operations.reduce((n, o) => n + o.passed, 0),
-    operations,
-    unmatched,
-  };
+  return executions;
 }
 
-async function replayOne(
-  sdk: SdkModule,
-  spec: Spec,
-  op: SpecOperation,
-  pathValues: Record<string, string>,
-  ex: Exchange,
-  validate: (schema: JsonSchema, value: unknown) => string | undefined,
-): Promise<string[]> {
-  const problems: string[] = [];
+const PYTHON_RUNNER = String.raw`
+import importlib.util, json, sys
 
-  const args: Record<string, unknown> = {};
-  for (const p of op.pathParams) args[pathArgName(p.name)] = coerceToSchema(pathValues[p.name] ?? "", p.schema);
-  const query = queryArgs(op.queryParams, ex.url);
-  if (query) args.query = query;
-  if (ex.requestBody !== undefined) args.body = ex.requestBody;
-  else if (op.body?.required) problems.push("recorded request has no body but the spec requires one");
+spec = importlib.util.spec_from_file_location("reversio_client", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+sys.modules["reversio_client"] = mod
+spec.loader.exec_module(mod)
 
-  let captured: CapturedRequest | undefined;
-  const fakeFetch = async (input: URL | RequestInfo, init?: RequestInit): Promise<Response> => {
-    captured = {
-      method: init?.method ?? "GET",
-      url: new URL(input instanceof Request ? input.url : String(input)),
-      headers: new Headers(init?.headers),
-      body: typeof init?.body === "string" ? init.body : null,
-    };
-    return recordedResponse(ex);
-  };
+out = []
+for case in json.load(sys.stdin):
+    entry = {}
+    response = case["response"]
 
-  // Primary-server operations may be recorded on any origin (staging, regional hosts), so the
-  // client is pointed at the recorded one; path-level servers are exercised as generated.
-  const prefix = serverPrefix(spec.servers[0]).map(encodeURIComponent).join("/");
-  const baseUrl = prefix ? `${ex.url.origin}/${prefix}` : ex.url.origin;
-  const client = new sdk.ApiClient({ fetch: fakeFetch, ...(!op.server && { baseUrl }) });
-  const method = client[sdkMethodName(op.operationId)];
-  if (typeof method !== "function") return [`SDK has no method ${sdkMethodName(op.operationId)}`];
+    def transport(request, response=response, entry=entry):
+        entry["request"] = {
+            "method": request.method,
+            "url": request.url,
+            "contentType": {k.lower(): v for k, v in request.headers.items()}.get("content-type"),
+            "body": None if request.body is None else request.body.decode("utf-8"),
+        }
+        headers = {"content-type": response["contentType"]} if response["contentType"] else {}
+        return mod.HttpResponse(response["status"], headers, (response["body"] or "").encode("utf-8"))
 
-  let result: unknown;
-  let error: unknown;
+    kwargs = {"transport": transport}
+    if case.get("baseUrl") is not None:
+        kwargs["base_url"] = case["baseUrl"]
+    client = mod.ApiClient(**kwargs)
+    method = getattr(client, case["method"], None)
+    if method is None:
+        entry["error"] = {"message": "SDK has no method " + case["method"]}
+    else:
+        call_kwargs = {}
+        if "query" in case:
+            call_kwargs["query"] = case["query"]
+        if "body" in case:
+            call_kwargs["body"] = case["body"]
+        try:
+            entry["result"] = method(*case["pathArgs"], **call_kwargs)
+        except mod.ApiError as err:
+            entry["error"] = {"status": err.status, "body": err.body, "message": str(err)}
+        except Exception as err:
+            entry["error"] = {"message": type(err).__name__ + ": " + str(err)}
+    out.append(entry)
+
+json.dump(out, sys.stdout)
+`;
+
+async function runPython(source: string, cases: ReplayCase[], python: string): Promise<Execution[]> {
+  const dir = await mkdtemp(join(tmpdir(), "reversio-py-"));
   try {
-    result = await method.call(client, args);
-  } catch (err) {
-    error = err;
+    const client = join(dir, "client.py");
+    const runner = join(dir, "runner.py");
+    await writeFile(client, source);
+    await writeFile(runner, PYTHON_RUNNER);
+    const input = JSON.stringify(
+      cases.map((c) => ({
+        method: pyMethodName(c.op.operationId),
+        pathArgs: c.pathArgs.map((p) => p.value),
+        ...(c.baseUrl !== undefined && { baseUrl: c.baseUrl }),
+        ...(c.query && { query: c.query }),
+        ...("body" in c && { body: c.body }),
+        response: c.response,
+      })),
+    );
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = spawn(python, ["-I", runner, client], { stdio: ["pipe", "pipe", "pipe"] });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
+      child.stderr.on("data", (d: Buffer) => (err += d.toString("utf8")));
+      child.on("error", (e: NodeJS.ErrnoException) =>
+        reject(new Error(e.code === "ENOENT" ? `Python interpreter not found: ${python} (set REVERSIO_PYTHON)` : e.message)),
+      );
+      child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`Python SDK failed to run:\n${err.trim()}`))));
+      child.stdin.end(input);
+    });
+    const executions = JSON.parse(stdout) as Execution[];
+    // Python has one "no value" (None) for both an empty body and JSON null.
+    return executions.map((e) => (e.result === null ? { ...e, result: undefined } : e));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
+}
 
-  if (!captured) {
-    problems.push(`SDK did not send a request (${error instanceof Error ? error.message : String(error)})`);
+function compare(c: ReplayCase, execution: Execution, validate: (schema: JsonSchema, value: unknown) => string | undefined): string[] {
+  const { op, ex } = c;
+  const problems: string[] = [];
+  if (ex.requestBody === undefined && op.body?.required) problems.push("recorded request has no body but the spec requires one");
+
+  const request = execution.request;
+  if (!request) {
+    problems.push(`SDK did not send a request (${execution.error?.message ?? "no error"})`);
     return problems;
   }
 
   // Request fidelity.
-  if (captured.method !== ex.method) problems.push(`method ${captured.method} != ${ex.method}`);
-  if (captured.url.origin !== ex.url.origin) problems.push(`origin ${captured.url.origin} != ${ex.url.origin}`);
-  if (!isDeepStrictEqual(segments(captured.url.pathname), segments(ex.url.pathname))) {
-    problems.push(`path ${captured.url.pathname} != ${ex.url.pathname}`);
+  const sent = new URL(request.url);
+  if (request.method !== ex.method) problems.push(`method ${request.method} != ${ex.method}`);
+  if (sent.origin !== ex.url.origin) problems.push(`origin ${sent.origin} != ${ex.url.origin}`);
+  if (!isDeepStrictEqual(segments(sent.pathname), segments(ex.url.pathname))) {
+    problems.push(`path ${sent.pathname} != ${ex.url.pathname}`);
   }
-  if (!isDeepStrictEqual(queryMultiset(captured.url), queryMultiset(ex.url))) {
-    problems.push(describeQueryDiff(captured.url, ex.url));
-  }
-  if (!isDeepStrictEqual(decodeSentBody(captured), ex.requestBody)) problems.push("request body differs");
+  if (!isDeepStrictEqual(queryMultiset(sent), queryMultiset(ex.url))) problems.push(describeQueryDiff(sent, ex.url));
+  if (!isDeepStrictEqual(decodeSentBody(request), ex.requestBody)) problems.push("request body differs");
 
   // Response handling.
-  const expected = ex.status === 204 || ex.status === 205 || ex.status === 304 ? undefined : ex.responseBody;
+  const expected = c.response.body === null ? undefined : ex.responseBody;
+  const error = execution.error;
   if (ex.status >= 200 && ex.status < 300) {
     if (error) problems.push(`SDK threw on a ${ex.status} response`);
-    else if (!isDeepStrictEqual(result, expected)) problems.push("SDK result differs from recorded response");
-  } else {
-    const status = (error as { status?: unknown } | undefined)?.status;
-    if (status !== ex.status) problems.push(`expected ApiError with status ${ex.status}`);
-    else if (!isDeepStrictEqual((error as { body?: unknown }).body, expected)) problems.push("ApiError body differs");
+    else if (!isDeepStrictEqual(execution.result, expected)) problems.push("SDK result differs from recorded response");
+  } else if (error?.status !== ex.status) {
+    problems.push(`expected ApiError with status ${ex.status}`);
+  } else if (!isDeepStrictEqual(error.body ?? undefined, expected)) {
+    problems.push("ApiError body differs");
   }
 
   // Schema conformance of the recorded payloads.
@@ -340,4 +421,70 @@ async function replayOne(
     if (invalid) problems.push(`request body schema: ${invalid}`);
   }
   return problems;
+}
+
+/**
+ * Verify recorded exchanges (already filtered to API calls) against a spec and
+ * its generated SDK.
+ */
+export async function verifyReplay(spec: Spec, exchanges: Exchange[], options: VerifyOptions = {}): Promise<VerifyReport> {
+  const language = options.language ?? "typescript";
+  const cases: ReplayCase[] = [];
+  const unmatched: VerifyReport["unmatched"] = [];
+  for (const ex of exchanges) {
+    if (ex.status < 200 || ex.status > 599) continue;
+    const match = matchOperation(spec, ex);
+    if (match) cases.push(buildCase(spec, match.op, match.pathValues, ex));
+    else unmatched.push({ method: ex.method, url: `${ex.url.origin}${ex.url.pathname}` });
+  }
+
+  const executions =
+    language === "python"
+      ? await runPython(
+          options.sdkSource ?? generatePythonSdk(spec),
+          cases,
+          options.python ?? process.env.REVERSIO_PYTHON ?? "python3",
+        )
+      : await runTypeScript(options.sdkSource ?? generateTypeScriptSdk(spec), cases);
+
+  const ajv = new Ajv2020({ allErrors: false, strict: false });
+  addFormats.default(ajv);
+  const validators = new Map<JsonSchema, ReturnType<typeof ajv.compile>>();
+  const validate = (schema: JsonSchema, value: unknown): string | undefined => {
+    let fn = validators.get(schema);
+    if (!fn) {
+      fn = ajv.compile(schema);
+      validators.set(schema, fn);
+    }
+    return fn(value) ? undefined : formatAjvErrors(fn.errors);
+  };
+
+  const reports = new Map<SpecOperation, { samples: number; passed: number; failures: Map<string, number> }>();
+  for (const op of spec.operations) reports.set(op, { samples: 0, passed: 0, failures: new Map() });
+  cases.forEach((c, i) => {
+    const report = reports.get(c.op)!;
+    report.samples++;
+    const problems = compare(c, executions[i] ?? {}, validate);
+    if (problems.length === 0) report.passed++;
+    for (const p of problems) report.failures.set(p, (report.failures.get(p) ?? 0) + 1);
+  });
+
+  const operations: OperationReport[] = spec.operations.map((op) => {
+    const r = reports.get(op)!;
+    return {
+      operationId: op.operationId,
+      method: op.method,
+      path: op.path,
+      samples: r.samples,
+      passed: r.passed,
+      failures: [...r.failures].sort((a, b) => b[1] - a[1]).map(([reason, count]) => ({ reason, count })),
+    };
+  });
+  return {
+    language,
+    total: operations.reduce((n, o) => n + o.samples, 0),
+    passed: operations.reduce((n, o) => n + o.passed, 0),
+    operations,
+    unmatched,
+  };
 }

@@ -7,11 +7,11 @@ reversio bu kayıttaki API çağrılarını ayıklar, yolları şablonlara dön�
 (`/users/42` → `/users/{userId}`), örneklerden JSON şemalarını çıkarır ve şunları üretir:
 
 1. geçerli bir **OpenAPI 3.1** belgesi,
-2. bağımlılıksız, tek dosyalık bir **TypeScript SDK**,
+2. bağımlılıksız, tek dosyalık **TypeScript** ve **Python** SDK'ları,
 3. bir **doğrulama raporu**: kaydedilen her çağrı SDK üzerinden yeniden oynatılır ve
    SDK'nın aynı isteği gönderip aynı yanıtı döndürdüğü kanıtlanır.
 
-> Durum: erken geliştirme (v0.2). Yol haritası aşağıda.
+> Durum: erken geliştirme (v0.3). Yol haritası aşağıda.
 
 ## Kurulum
 
@@ -27,7 +27,8 @@ npm run build
 3. Çalıştırın:
 
 ```bash
-node dist/cli.js generate capture.har -o out/
+node dist/cli.js generate capture.har -o out/              # TypeScript
+node dist/cli.js generate capture.har -o out/ --lang ts,py  # TypeScript + Python
 ```
 
 Örnek çıktı (`tests/fixtures/demo.har` için):
@@ -54,8 +55,8 @@ const repos = await api.getUsersRepos({ userId: "octo", query: { per_page: 30 } 
 | --- | --- |
 | `generate <har>... -o <dizin>` | Spec, SDK ve doğrulama raporunu tek adımda üretir |
 | `openapi <har>... [-o dosya]` | Yalnızca OpenAPI spec'i üretir |
-| `sdk <spec> -o client.ts` | Herhangi bir OpenAPI 3 spec'inden TypeScript SDK üretir |
-| `verify <spec> <har>...` | Spec'i ve SDK'yı yeni bir yakalamaya karşı doğrular |
+| `sdk <spec> -o client.ts\|client.py` | Herhangi bir OpenAPI 3 spec'inden SDK üretir (dil, dosya uzantısından anlaşılır) |
+| `verify <spec> <har>... [--lang py]` | Spec'i ve SDK'yı yeni bir yakalamaya karşı doğrular |
 
 **API değişikliklerini yakalamak (drift):** Spec'i bir kez üretin, sonra yeni kayıtları
 `verify` ile kontrol edin. Yeni endpoint'ler, parametreler, alan tipi değişiklikleri ve
@@ -76,6 +77,7 @@ hata sayılır.
 | `--host <host>` | Yalnızca bu host'u dahil et (tekrarlanabilir) |
 | `--title <başlık>` | Spec başlığı |
 | `--examples` | Gözlenen örnek değerleri ekle (varsayılan kapalı) |
+| `--lang <dil>` | `typescript`/`ts` veya `python`/`py`; `generate` birden fazla dil alabilir |
 | `--class <ad>` | Üretilen istemci sınıfının adı (varsayılan `ApiClient`) |
 | `--yaml` | `openapi`: stdout'a YAML yaz |
 | `--json` | `verify`: raporu JSON olarak yaz |
@@ -98,6 +100,8 @@ hata sayılır.
 
 ## SDK
 
+### TypeScript
+
 - Tek dosya ve sıfır bağımlılık: yalnızca standart `fetch` kullanır. Node 18+, Deno, Bun ve
   tarayıcılarda çalışır.
 - Her operasyon için tipli argümanlar (`path` parametreleri, `query`, `body`) ve yanıt tipleri üretir.
@@ -105,6 +109,22 @@ hata sayılır.
 - 2xx dışı yanıtlarda, ayrıştırılmış gövdeyle birlikte `ApiError` fırlatır.
 - `fetch` enjekte edilebilir (proxy, retry, test), `servers` ile ikincil sunucular yönlendirilebilir.
 - Yalnızca silinebilir TypeScript sözdizimi kullanır, bu yüzden tip temizleme ve her bundler ile uyumludur.
+
+### Python
+
+```python
+from client import ApiClient, ApiError
+
+api = ApiClient(auth={"bearerAuth": os.environ["TOKEN"]})
+repos = api.get_users_repos("octo", query={"per_page": 30})
+print(repos[0]["full_name"])
+```
+
+- Python 3.11+, yalnızca standart kütüphane (`urllib`). Ek paket gerekmez.
+- Gövde ve yanıt tipleri `TypedDict` olarak üretilir ve `mypy --strict` ile temiz geçer.
+- Path parametreleri konumsal, `query` ve `body` yalnızca anahtar kelimeyle verilir.
+- `transport=` ile HTTP katmanı değiştirilebilir (proxy, retry, test). 2xx dışı yanıtlarda `ApiError` fırlatılır.
+- `verify --lang py`, Python SDK'yı da kaydedilen trafikle tekrar oynatarak doğrular.
 
 ## Gizlilik
 
@@ -122,7 +142,7 @@ hizmet koşullarına uygun şekilde kullanın.
 - [x] HAR → OpenAPI 3.1 (yol şablonları, şema çıkarımı, auth tespiti)
 - [x] OpenAPI → tipli TypeScript SDK
 - [x] Kaydedilen trafiği tekrar oynatarak SDK doğrulama ve drift raporu
-- [ ] Python SDK
+- [x] Python SDK (tekrar oynatarak doğrulama ve `mypy --strict` dahil)
 - [ ] mitmproxy akışlarını içe aktarma
 - [ ] Playwright ile otomatik keşif, `reversio <url>` tek komutu
 - [ ] MCP sunucusu (ajanlar için 4–5 araç)
@@ -130,7 +150,8 @@ hizmet koşullarına uygun şekilde kullanın.
 ## Geliştirme
 
 ```bash
-npm test          # vitest (üretilen SDK katı TypeScript ayarlarıyla derlenerek test edilir)
+npm test          # vitest; üretilen SDK'lar katı TypeScript ayarlarıyla derlenir
+                  # Python testleri için python3 (3.11+); mypy kuruluysa REVERSIO_MYPY=mypy
 npm run typecheck
 npm run build
 ```

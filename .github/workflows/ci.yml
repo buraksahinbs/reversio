@@ -11,7 +11,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mypy
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          REVERSIO_PYTHON: python
+          REVERSIO_MYPY: mypy
       - run: npm run build

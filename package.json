@@ -1,6 +1,6 @@
 {
   "name": "reversio",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Turn captured traffic of undocumented web APIs into OpenAPI specs and replay-verified typed SDKs.",
   "license": "MIT",
   "type": "module",

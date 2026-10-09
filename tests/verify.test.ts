@@ -49,7 +49,7 @@ describe("verifyReplay", () => {
 
   it("catches an SDK that builds requests incorrectly", async () => {
     const broken = generateTypeScriptSdk(shopSpec).replace("`/v1/products/${", "`/v1/product/${");
-    const report = await verifyReplay(shopSpec, shopCalls, broken);
+    const report = await verifyReplay(shopSpec, shopCalls, { sdkSource: broken });
     expect(failuresOf(report).getProductsById).toEqual([
       "path /v1/product/10 != /v1/products/10",
       "path /v1/product/11 != /v1/products/11",
@@ -60,7 +60,7 @@ describe("verifyReplay", () => {
 
   it("catches an SDK that mishandles responses", async () => {
     const broken = generateTypeScriptSdk(shopSpec).replace("if (!response.ok) throw new ApiError(response, data);", "");
-    const report = await verifyReplay(shopSpec, shopCalls, broken);
+    const report = await verifyReplay(shopSpec, shopCalls, { sdkSource: broken });
     expect(failuresOf(report)).toEqual({ getProductsById: ["expected ApiError with status 404"] });
   });
 });

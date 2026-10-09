@@ -6,22 +6,25 @@ import { stringify as toYaml } from "yaml";
 import { filterExchanges } from "./filter.js";
 import { parseHar, type Exchange } from "./har.js";
 import { buildOpenApi, type OpenApiDocument } from "./openapi.js";
+import { generatePythonSdk } from "./sdk/python.js";
 import { generateTypeScriptSdk } from "./sdk/typescript.js";
-import { loadSpec, readSpec } from "./spec.js";
-import { verifyReplay, type VerifyReport } from "./verify.js";
+import { loadSpec, readSpec, type Spec } from "./spec.js";
+import { verifyReplay, type SdkLanguage, type VerifyReport } from "./verify.js";
 
 const USAGE = `reversio — turn captured API traffic into an OpenAPI spec and a verified SDK
 
 Usage:
-  reversio generate <capture.har>... -o <dir>   Spec + TypeScript SDK + replay verification
+  reversio generate <capture.har>... -o <dir>   Spec + SDK(s) + replay verification
   reversio openapi  <capture.har>... [-o file]  OpenAPI 3.1 spec only
-  reversio sdk      <spec.yaml|json> -o client.ts
-  reversio verify   <spec.yaml|json> <capture.har>...
+  reversio sdk      <spec.yaml|json> -o client.ts|client.py
+  reversio verify   <spec.yaml|json> <capture.har>... [--lang python]
 
 Options:
   -o, --output <path>   Output file (openapi, sdk) or directory (generate).
       --host <host>     Only include this host (repeatable), e.g. api.example.com.
       --title <title>   API title in the spec.
+      --lang <lang>     SDK language: typescript (ts) or python (py). generate accepts
+                        several (--lang ts --lang py); sdk infers it from -o.
       --class <name>    Class name of the generated client (default ApiClient).
       --examples        Include observed example values in the spec. Off by default
                         because captures can contain personal data and secrets.
@@ -39,6 +42,7 @@ const OPTIONS = {
   host: { type: "string", multiple: true },
   title: { type: "string" },
   class: { type: "string" },
+  lang: { type: "string", multiple: true },
   examples: { type: "boolean", default: false },
   yaml: { type: "boolean", default: false },
   json: { type: "boolean", default: false },
@@ -49,6 +53,34 @@ const OPTIONS = {
 type Values = ReturnType<typeof parseArgs<{ options: typeof OPTIONS; allowPositionals: true }>>["values"];
 
 class UsageError extends Error {}
+
+const LANGUAGES: Record<string, SdkLanguage> = { typescript: "typescript", ts: "typescript", python: "python", py: "python" };
+const SDK_FILES: Record<SdkLanguage, string> = { typescript: "client.ts", python: "client.py" };
+
+function languages(values: Values, fallback: SdkLanguage): SdkLanguage[] {
+  const requested = (values.lang ?? []).flatMap((l) => l.split(",")).map((l) => l.trim().toLowerCase()).filter(Boolean);
+  if (requested.length === 0) return [fallback];
+  return [
+    ...new Set(
+      requested.map((l) => {
+        const lang = LANGUAGES[l];
+        if (!lang) throw new UsageError(`Unknown language: ${l} (use typescript or python)`);
+        return lang;
+      }),
+    ),
+  ];
+}
+
+function singleLanguage(values: Values, fallback: SdkLanguage): SdkLanguage {
+  const langs = languages(values, fallback);
+  if (langs.length > 1) throw new UsageError("This command takes one --lang.");
+  return langs[0]!;
+}
+
+function generateSdk(spec: Spec, language: SdkLanguage, values: Values): string {
+  const options = values.class ? { className: values.class } : {};
+  return language === "python" ? generatePythonSdk(spec, options) : generateTypeScriptSdk(spec, options);
+}
 
 async function loadApiCalls(files: string[], values: Values): Promise<{ all: number; api: Exchange[] }> {
   if (files.length === 0) throw new UsageError("No HAR file given.");
@@ -122,7 +154,8 @@ async function runOpenApi(files: string[], values: Values): Promise<number> {
 async function runSdk(files: string[], values: Values): Promise<number> {
   if (files.length !== 1) throw new UsageError("sdk takes exactly one spec file.");
   const spec = loadSpec(await readFile(files[0]!, "utf8"));
-  const source = generateTypeScriptSdk(spec, values.class ? { className: values.class } : {});
+  const language = singleLanguage(values, values.output?.endsWith(".py") ? "python" : "typescript");
+  const source = generateSdk(spec, language, values);
   if (values.output) {
     await writeFile(values.output, source);
     process.stderr.write(`${spec.operations.length} operations → ${values.output}\n`);
@@ -137,7 +170,7 @@ async function runVerify(files: string[], values: Values): Promise<number> {
   if (!specFile || hars.length === 0) throw new UsageError("verify takes a spec file and at least one HAR file.");
   const spec = loadSpec(await readFile(specFile, "utf8"));
   const { api } = await loadApiCalls(hars, values);
-  const report = await verifyReplay(spec, api);
+  const report = await verifyReplay(spec, api, { language: singleLanguage(values, "typescript") });
   process.stdout.write(values.json ? JSON.stringify(report, null, 2) + "\n" : formatReport(report));
   return verifyExitCode(report, values.strict);
 }
@@ -147,19 +180,25 @@ async function runGenerate(files: string[], values: Values): Promise<number> {
   const { all, api } = await loadApiCalls(files, values);
   const doc = specFrom(api, values);
   const spec = readSpec(doc);
-  const source = generateTypeScriptSdk(spec, values.class ? { className: values.class } : {});
-  const report = await verifyReplay(spec, api, source);
 
   await mkdir(values.output, { recursive: true });
   await writeFile(join(values.output, "openapi.yaml"), toYaml(doc, { aliasDuplicateObjects: false }));
-  await writeFile(join(values.output, "client.ts"), source);
-  await writeFile(join(values.output, "verify-report.json"), JSON.stringify(report, null, 2) + "\n");
+  process.stderr.write(`${all} requests → ${api.length} API calls → ${countOperations(doc)} operations\n`);
 
-  process.stderr.write(
-    `${all} requests → ${api.length} API calls → ${countOperations(doc)} operations\n` + formatReport(report),
-  );
-  process.stderr.write(`Wrote ${join(values.output, "openapi.yaml")}, client.ts, verify-report.json\n`);
-  return verifyExitCode(report, values.strict);
+  const written = ["openapi.yaml"];
+  const reports: VerifyReport[] = [];
+  for (const language of languages(values, "typescript")) {
+    const source = generateSdk(spec, language, values);
+    await writeFile(join(values.output, SDK_FILES[language]), source);
+    written.push(SDK_FILES[language]);
+    const report = await verifyReplay(spec, api, { language, sdkSource: source });
+    reports.push(report);
+    process.stderr.write(`[${language}]\n${formatReport(report)}`);
+  }
+  await writeFile(join(values.output, "verify-report.json"), JSON.stringify(reports, null, 2) + "\n");
+  written.push("verify-report.json");
+  process.stderr.write(`Wrote ${written.map((f) => join(values.output!, f)).join(", ")}\n`);
+  return Math.max(...reports.map((r) => verifyExitCode(r, values.strict)));
 }
 
 async function main(argv: string[]): Promise<number> {
