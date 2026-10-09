@@ -6,6 +6,7 @@ import { stringify as toYaml } from "yaml";
 import { filterExchanges } from "./filter.js";
 import { parseHar, type Exchange } from "./har.js";
 import { buildOpenApi, type OpenApiDocument } from "./openapi.js";
+import { record } from "./record.js";
 import { generatePythonSdk } from "./sdk/python.js";
 import { generateTypeScriptSdk } from "./sdk/typescript.js";
 import { loadSpec, readSpec, type Spec } from "./spec.js";
@@ -14,6 +15,7 @@ import { verifyReplay, type SdkLanguage, type VerifyReport } from "./verify.js";
 const USAGE = `reversio — turn captured API traffic into an OpenAPI spec and a verified SDK
 
 Usage:
+  reversio record   <url> [-o capture.har] [--generate <dir>]  Record traffic in a browser
   reversio generate <capture.har>... -o <dir>   Spec + SDK(s) + replay verification
   reversio openapi  <capture.har>... [-o file]  OpenAPI 3.1 spec only
   reversio sdk      <spec.yaml|json> -o client.ts|client.py
@@ -31,9 +33,13 @@ Options:
       --yaml            openapi: print YAML instead of JSON on stdout.
       --json            verify: print the report as JSON.
       --strict          verify: also fail on recorded calls the spec does not cover.
+      --generate <dir>  record: run generate on the capture when recording stops.
+      --headless        record: run the browser without a window.
+      --timeout <sec>   record: stop recording after this many seconds.
+      --browser <path>  record: browser executable (default: installed Chrome or Edge).
   -h, --help            Show this help.
 
-Capture a HAR from your browser: DevTools → Network → right click →
+Or capture a HAR yourself: DevTools → Network → right click →
 "Save all as HAR with content".
 `;
 
@@ -47,6 +53,10 @@ const OPTIONS = {
   yaml: { type: "boolean", default: false },
   json: { type: "boolean", default: false },
   strict: { type: "boolean", default: false },
+  generate: { type: "string" },
+  headless: { type: "boolean", default: false },
+  timeout: { type: "string" },
+  browser: { type: "string" },
   help: { type: "boolean", short: "h", default: false },
 } as const;
 
@@ -201,6 +211,53 @@ async function runGenerate(files: string[], values: Values): Promise<number> {
   return Math.max(...reports.map((r) => verifyExitCode(r, values.strict)));
 }
 
+async function runRecord(positionals: string[], values: Values): Promise<number> {
+  const [target] = positionals;
+  if (!target || positionals.length > 1) throw new UsageError("record takes exactly one URL.");
+  let url: URL;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(target) ? target : `https://${target}`);
+  } catch {
+    throw new UsageError(`Not a URL: ${target}`);
+  }
+  const timeoutMs = values.timeout === undefined ? undefined : Number(values.timeout) * 1000;
+  if (timeoutMs !== undefined && !(timeoutMs > 0)) throw new UsageError("--timeout must be a positive number of seconds.");
+  const harPath = values.output ?? "capture.har";
+
+  const controller = new AbortController();
+  const onSigint = () => controller.abort();
+  process.once("SIGINT", onSigint);
+  process.stderr.write(
+    `Recording ${url.href}\nUse the app as usual. Close the browser tab or window, or press Ctrl+C, to finish.\n`,
+  );
+  let apiCalls = 0;
+  try {
+    const result = await record({
+      url: url.href,
+      harPath,
+      headless: values.headless,
+      signal: controller.signal,
+      ...(timeoutMs !== undefined && { timeoutMs }),
+      ...(values.browser !== undefined && { executablePath: values.browser }),
+      onRequest: ({ method, url: requestUrl, status, resourceType }) => {
+        if (resourceType !== "fetch" && resourceType !== "xhr") return;
+        apiCalls++;
+        const u = new URL(requestUrl);
+        process.stderr.write(`  ${status} ${method} ${u.host}${u.pathname}\n`);
+      },
+    });
+    process.stderr.write(
+      `Stopped (${result.stoppedBy}): ${result.requests} requests, ${apiCalls} fetch/XHR calls → ${harPath}\n` +
+        `The capture contains this session's cookies and tokens. Keep it private.\n`,
+    );
+  } finally {
+    process.off("SIGINT", onSigint);
+  }
+
+  if (values.generate === undefined) return 0;
+  return runGenerate([harPath], { ...values, output: values.generate });
+}
+
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   if (command === undefined || command === "help" || command === "-h" || command === "--help") {
@@ -209,6 +266,7 @@ async function main(argv: string[]): Promise<number> {
   }
   const commands: Record<string, (files: string[], values: Values) => Promise<number>> = {
     generate: runGenerate,
+    record: runRecord,
     openapi: runOpenApi,
     sdk: runSdk,
     verify: runVerify,

@@ -11,7 +11,7 @@ reversio bu kayıttaki API çağrılarını ayıklar, yolları şablonlara dön�
 3. bir **doğrulama raporu**: kaydedilen her çağrı SDK üzerinden yeniden oynatılır ve
    SDK'nın aynı isteği gönderip aynı yanıtı döndürdüğü kanıtlanır.
 
-> Durum: erken geliştirme (v0.3). Yol haritası aşağıda.
+> Durum: erken geliştirme (v0.4). Yol haritası aşağıda.
 
 ## Kurulum
 
@@ -21,6 +21,36 @@ npm run build
 ```
 
 ## Kullanım
+
+### En hızlı yol: tarayıcıda kaydet
+
+```bash
+node dist/cli.js record https://app.example.com --generate out/ --lang ts,py
+```
+
+Bir tarayıcı penceresi açılır. Uygulamayı her zamanki gibi kullanın (giriş yapın, sayfalar
+arasında gezinin, form gönderin). Bitirdiğinizde sekmeyi veya pencereyi kapatın ya da
+terminalde **Ctrl+C**'ye basın. Kayıt `capture.har` dosyasına yazılır, ardından spec,
+SDK'lar ve doğrulama raporu `out/` dizinine üretilir.
+
+Örnek çıktı (testlerdeki yerel demo uygulaması için):
+
+```
+Recording http://127.0.0.1:39667/
+  200 GET 127.0.0.1:39667/api/items
+  200 GET 127.0.0.1:39667/api/items/42
+  201 POST 127.0.0.1:39667/api/items
+  ...
+Stopped (closed): 7 requests, 6 fetch/XHR calls → capture.har
+[typescript] Replay: 6/6 recorded calls reproduced by the SDK
+[python]     Replay: 6/6 recorded calls reproduced by the SDK
+```
+
+Kayıt sırasında yalnızca `fetch`/XHR çağrıları listelenir. Varsayılan olarak yüklü Google
+Chrome veya Edge kullanılır; başka bir tarayıcı için `--browser <yol>` verin. Otomasyon
+için `--headless --timeout 30` kullanılabilir.
+
+### Elle HAR ile
 
 1. Tarayıcıda DevTools → **Network** sekmesini açın, uygulamayı kullanın.
 2. İstek listesine sağ tıklayın → **Save all as HAR with content**.
@@ -53,6 +83,7 @@ const repos = await api.getUsersRepos({ userId: "octo", query: { per_page: 30 } 
 
 | Komut | Ne yapar |
 | --- | --- |
+| `record <url> [-o dosya.har] [--generate <dizin>]` | Tarayıcıda trafiği kaydeder, isteğe bağlı olarak hemen `generate` çalıştırır |
 | `generate <har>... -o <dizin>` | Spec, SDK ve doğrulama raporunu tek adımda üretir |
 | `openapi <har>... [-o dosya]` | Yalnızca OpenAPI spec'i üretir |
 | `sdk <spec> -o client.ts\|client.py` | Herhangi bir OpenAPI 3 spec'inden SDK üretir (dil, dosya uzantısından anlaşılır) |
@@ -78,6 +109,7 @@ hata sayılır.
 | `--title <başlık>` | Spec başlığı |
 | `--examples` | Gözlenen örnek değerleri ekle (varsayılan kapalı) |
 | `--lang <dil>` | `typescript`/`ts` veya `python`/`py`; `generate` birden fazla dil alabilir |
+| `--headless`, `--timeout <sn>`, `--browser <yol>` | `record`: penceresiz çalıştır, süre sınırı, tarayıcı yolu |
 | `--class <ad>` | Üretilen istemci sınıfının adı (varsayılan `ApiClient`) |
 | `--yaml` | `openapi`: stdout'a YAML yaz |
 | `--json` | `verify`: raporu JSON olarak yaz |
@@ -144,7 +176,7 @@ hizmet koşullarına uygun şekilde kullanın.
 - [x] Kaydedilen trafiği tekrar oynatarak SDK doğrulama ve drift raporu
 - [x] Python SDK (tekrar oynatarak doğrulama ve `mypy --strict` dahil)
 - [ ] mitmproxy akışlarını içe aktarma
-- [ ] Playwright ile otomatik keşif, `reversio <url>` tek komutu
+- [x] Tarayıcıda kayıt: `reversio record <url> --generate out/`
 - [ ] MCP sunucusu (ajanlar için 4–5 araç)
 
 ## Geliştirme
